@@ -23,7 +23,6 @@
 #include <linux/list.h>
 
 #include <linux/delay.h>
-#include <linux/timer.h>
 #include <linux/interrupt.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmapool.h>
@@ -45,18 +44,6 @@
 #include <mach/clk.h>
 #include <linux/uaccess.h>
 #include <linux/wakelock.h>
-
-#ifdef CONFIG_USB_AUTO_INSTALL
-#include <linux/syscalls.h>
-#include <linux/debugfs.h>
-#include "usb_switch_huawei.h"
-#include "../../../arch/arm/mach-msm/proc_comm.h"
-
-usb_switch_stru usb_switch_para;
-void ms_delay_work_init(int add_flag);
-void android_delay_work_init(int add_flag);
-static u8 is_mmc_exist = false;
-#endif  /* CONFIG_USB_AUTO_INSTALL */
 
 static const char driver_name[] = "msm72k_udc";
 
@@ -134,9 +121,6 @@ struct msm_endpoint {
 	struct ept_queue_head *head;
 };
 
-/* PHY status check timer to monitor phy stuck up on reset */
-static struct timer_list phy_status_timer;
-
 static void usb_do_work(struct work_struct *w);
 static void usb_do_remote_wakeup(struct work_struct *w);
 
@@ -152,15 +136,8 @@ static void usb_do_remote_wakeup(struct work_struct *w);
 #define USB_FLAG_SUSPEND        0x0010
 #define USB_FLAG_CONFIGURED     0x0020
 
-
-#ifdef CONFIG_USB_AUTO_INSTALL
-#define USB_INTERRUPT_NORMAL          0x0000
-#define USB_INTERRUPT_ABNORMAL        0x0001
-#endif
-
 #define USB_CHG_DET_DELAY	msecs_to_jiffies(1000)
 #define REMOTE_WAKEUP_DELAY	msecs_to_jiffies(1000)
-#define PHY_STATUS_CHECK_DELAY	msecs_to_jiffies(1000)
 
 struct usb_info {
 	/* lock for register/queue/device state changes */
@@ -196,14 +173,14 @@ struct usb_info {
 	*/
 	struct msm_endpoint ept[32];
 
+	int *phy_init_seq;
+	void (*phy_reset)(void);
 
 	/* max power requested by selected configuration */
 	unsigned b_max_pow;
 	unsigned chg_current;
 	struct delayed_work chg_det;
 	struct delayed_work chg_stop;
-	struct msm_hsusb_gadget_platform_data *pdata;
-	struct work_struct phy_status_check;
 
 	struct work_struct work;
 	unsigned phy_status;
@@ -219,7 +196,6 @@ struct usb_info {
 	atomic_t ep0_dir;
 	atomic_t test_mode;
 	atomic_t offline_pending;
-	atomic_t softconnect;
 #ifdef CONFIG_USB_OTG
 	u8 hnp_avail;
 #endif
@@ -236,128 +212,10 @@ struct usb_info {
 static const struct usb_ep_ops msm72k_ep_ops;
 static struct usb_info *the_usb_info;
 
-#ifdef CONFIG_HUAWEI_KERNEL
-static struct wake_lock charger_wlock;
-#endif
 static int msm72k_wakeup(struct usb_gadget *_gadget);
 static int msm72k_pullup_internal(struct usb_gadget *_gadget, int is_active);
 static int msm72k_set_halt(struct usb_ep *_ep, int value);
 static void flush_endpoint(struct msm_endpoint *ept);
-static void usb_reset(struct usb_info *ui);
-static unsigned ulpi_read(struct usb_info *ui, unsigned reg)
-{
-	unsigned ret, timeout = 100000;
-
-
-	/* initiate read operation */
-	writel(ULPI_RUN | ULPI_READ | ULPI_ADDR(reg),
-	       USB_ULPI_VIEWPORT);
-
-	/* wait for completion */
-	while ((readl(USB_ULPI_VIEWPORT) & ULPI_RUN) && (--timeout))
-		cpu_relax();
-
-	if (timeout == 0) {
-		printk(KERN_ERR "ulpi_read: timeout %08x\n",
-			readl(USB_ULPI_VIEWPORT));
-		return 0xffffffff;
-	}
-	ret = ULPI_DATA_READ(readl(USB_ULPI_VIEWPORT));
-
-
-	return ret;
-}
-static int ulpi_write(struct usb_info *ui, unsigned val, unsigned reg)
-{
-	unsigned timeout = 10000;
-
-	/* initiate write operation */
-	writel(ULPI_RUN | ULPI_WRITE |
-	       ULPI_ADDR(reg) | ULPI_DATA(val),
-	       USB_ULPI_VIEWPORT);
-
-	/* wait for completion */
-	while ((readl(USB_ULPI_VIEWPORT) & ULPI_RUN) && (--timeout))
-		;
-
-	if (timeout == 0) {
-		dev_err(&ui->pdev->dev, "ulpi_write: timeout\n");
-		return -1;
-	}
-
-	return 0;
-}
-
-static void msm_hsusb_set_speed(struct usb_info *ui)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&ui->lock, flags);
-	switch (readl(USB_PORTSC) & PORTSC_PSPD_MASK) {
-	case PORTSC_PSPD_FS:
-		dev_dbg(&ui->pdev->dev, "portchange USB_SPEED_FULL\n");
-		ui->gadget.speed = USB_SPEED_FULL;
-		break;
-	case PORTSC_PSPD_LS:
-		dev_dbg(&ui->pdev->dev, "portchange USB_SPEED_LOW\n");
-		ui->gadget.speed = USB_SPEED_LOW;
-		break;
-	case PORTSC_PSPD_HS:
-		dev_dbg(&ui->pdev->dev, "portchange USB_SPEED_HIGH\n");
-		ui->gadget.speed = USB_SPEED_HIGH;
-		break;
-	}
-	spin_unlock_irqrestore(&ui->lock, flags);
-}
-#ifdef CONFIG_USB_AUTO_INSTALL
-void initiate_switch_to_cdrom(unsigned long delay_t)
-{
-    USB_PR("lxy: %s\n", __func__);
-
-    /* when unplug the usb line, if the usb mode is wlan, 
-       switch to the before mode. 
-    */
-    if (android_get_product_id() == curr_usb_pid_ptr->wlan_pid)
-    {
-      usb_switch_composition(usb_para_info.usb_pid, delay_t);
-      return;
-    }
-    
-    /* add new pid config for google */
-    if((usb_para_info.usb_pid == curr_usb_pid_ptr->norm_pid) || 
-        (usb_para_info.usb_pid == curr_usb_pid_ptr->auth_pid) ||
-        (usb_para_info.usb_pid == curr_usb_pid_ptr->google_pid)
-        )
-    {
-        USB_PR("lxy: switch to cdrom blocked, usb_para_info.usb_pid=0x%x\n", usb_para_info.usb_pid);
-        /* prevent usb switching */
-        return;
-    }
-
-    if(GOOGLE_INDEX == usb_para_info.usb_pid_index)
-    {
-        USB_PR("lxy: switch to cdrom blocked, usb_para_info.usb_pid_index=%d\n", usb_para_info.usb_pid_index);
-        /* prevent usb switching */
-        return;
-    }
-
-    usb_switch_composition(curr_usb_pid_ptr->cdrom_pid, delay_t);
-    
-}
-
-void usb_get_state(unsigned *state_para, unsigned *usb_state_para)
-{
-	struct usb_info *ui = the_usb_info;
-    *state_para = ui->state;
-    *usb_state_para = (unsigned)ui->usb_state;
-}
-
-u8 get_mmc_exist(void)
-{
-	return is_mmc_exist;
-}
-#endif  /* CONFIG_USB_AUTO_INSTALL */
-
 
 static void msm_hsusb_set_state(enum usb_device_state state)
 {
@@ -430,71 +288,6 @@ static int usb_get_max_power(struct usb_info *ui)
 	return bmaxpow;
 }
 
-static int usb_phy_stuck_check(struct usb_info *ui)
-{
-	unsigned long flags;
-	/*
-	 * write some value (0xAA) into scratch reg (0x16) and read it back,
-	 * If the read value is same as written value, means PHY is normal
-	 * otherwise, PHY seems to have stuck.
-	 */
-
-	spin_lock_irqsave(&ui->lock, flags);
-	if (ulpi_write(ui, 0xAA, 0x16) == -1) {
-		dev_dbg(&ui->pdev->dev,
-			"%s(): ulpi write timeout\n", __func__);
-		return -EIO;
-	}
-	if (ulpi_read(ui, 0x16) != 0xAA) {
-		dev_dbg(&ui->pdev->dev,
-			"%s(): read value is incorrect\n", __func__);
-		return -EIO;
-	}
-	spin_unlock_irqrestore(&ui->lock, flags);
-	return 0;
-}
-
-/*
- * This function checks the phy status by reading/writing to the
- * phy scratch register. If the phy is stuck resets the HW
- * */
-static void usb_phy_stuck_recover(struct work_struct *w)
-{
-	struct usb_info *ui = the_usb_info;
-	struct msm_otg *otg = to_msm_otg(ui->xceiv);
-	unsigned long flags;
-
-	spin_lock_irqsave(&ui->lock, flags);
-	if (ui->gadget.speed != USB_SPEED_UNKNOWN ||
-			ui->usb_state == USB_STATE_NOTATTACHED ||
-			ui->driver == NULL) {
-		spin_unlock_irqrestore(&ui->lock, flags);
-		return;
-	}
-	spin_unlock_irqrestore(&ui->lock, flags);
-
-	disable_irq(otg->irq);
-	if (usb_phy_stuck_check(ui)) {
-		ui->phy_fail_count++;
-		dev_info(&ui->pdev->dev,
-				"%s():PHY stuck, resetting HW\n", __func__);
-		/*
-		 * PHY seems to have stuck,
-		 * reset the PHY and HW link to recover the PHY
-		 */
-		usb_reset(ui);
-		msm72k_pullup_internal(&ui->gadget, 1);
-	}
-	enable_irq(otg->irq);
-}
-
-static void usb_phy_status_check_timer(unsigned long data)
-{
-	struct usb_info *ui = the_usb_info;
-
-	schedule_work(&ui->phy_status_check);
-}
-
 static void usb_chg_stop(struct work_struct *w)
 {
 	struct usb_info *ui = container_of(w, struct usb_info, chg_stop.work);
@@ -539,10 +332,6 @@ static void usb_chg_detect(struct work_struct *w)
 	if (temp == USB_CHG_TYPE__WALLCHARGER) {
 		pm_runtime_put_sync(&ui->pdev->dev);
 		wake_unlock(&ui->wlock);
-		#ifdef CONFIG_HUAWEI_KERNEL
-		wake_lock(&charger_wlock);		
-		printk(KERN_ERR "%s:lock charger_wlock\n",__func__);
-		#endif
 	}
 }
 
@@ -558,6 +347,22 @@ static int usb_ep_get_stall(struct msm_endpoint *ept)
 		return (CTRL_RXS & n) ? 1 : 0;
 }
 
+static void ulpi_write(struct usb_info *ui, unsigned val, unsigned reg)
+{
+	unsigned timeout = 10000;
+
+	/* initiate write operation */
+	writel(ULPI_RUN | ULPI_WRITE |
+	       ULPI_ADDR(reg) | ULPI_DATA(val),
+	       USB_ULPI_VIEWPORT);
+
+	/* wait for completion */
+	while ((readl(USB_ULPI_VIEWPORT) & ULPI_RUN) && (--timeout))
+		;
+
+	if (timeout == 0)
+		dev_err(&ui->pdev->dev, "ulpi_write: timeout\n");
+}
 
 static void init_endpoints(struct usb_info *ui)
 {
@@ -1031,18 +836,6 @@ static void handle_setup(struct usb_info *ui)
 			atomic_set(&ui->configured, !!ctl.wValue);
 			msm_hsusb_set_state(USB_STATE_CONFIGURED);
 		} else if (ctl.bRequest == USB_REQ_SET_ADDRESS) {
-			/*
-			 * Gadget speed should be set when PCI interrupt
-			 * occurs. But sometimes, PCI interrupt is not
-			 * occuring after reset. Hence update the gadget
-			 * speed here.
-			 */
-			if (ui->gadget.speed == USB_SPEED_UNKNOWN) {
-				dev_info(&ui->pdev->dev,
-					"PCI intr missed"
-					"set speed explictly\n");
-				msm_hsusb_set_speed(ui);
-			}
 			msm_hsusb_set_state(USB_STATE_ADDRESS);
 
 			/* write address delayed (will take effect
@@ -1185,7 +978,7 @@ static void flush_endpoint_hw(struct usb_info *ui, unsigned bits)
 static void flush_endpoint_sw(struct msm_endpoint *ept)
 {
 	struct usb_info *ui = ept->ui;
-	struct msm_request *req, *next_req = NULL;
+	struct msm_request *req;
 	unsigned long flags;
 
 	/* inactive endpoints have nothing to do here */
@@ -1206,18 +999,12 @@ static void flush_endpoint_sw(struct msm_endpoint *ept)
 		req->live = 0;
 		req->req.status = -ESHUTDOWN;
 		req->req.actual = 0;
-
-		/* Gadget driver may free the request in completion
-		 * handler. So keep a copy of next req pointer
-		 * before calling completion handler.
-		 */
-		next_req = req->next;
 		if (req->req.complete) {
 			spin_unlock_irqrestore(&ui->lock, flags);
 			req->req.complete(&ept->ep, &req->req);
 			spin_lock_irqsave(&ui->lock, flags);
 		}
-		req = next_req;
+		req = req->next;
 	}
 	spin_unlock_irqrestore(&ui->lock, flags);
 }
@@ -1238,9 +1025,6 @@ static void flush_all_endpoints(struct usb_info *ui)
 		flush_endpoint_sw(ui->ept + n);
 }
 
-#ifdef CONFIG_USB_AUTO_INSTALL
-static int usb_redo_offline_flag = USB_INTERRUPT_NORMAL;
-#endif
 
 static irqreturn_t usb_interrupt(int irq, void *data)
 {
@@ -1256,7 +1040,20 @@ static irqreturn_t usb_interrupt(int irq, void *data)
 		return IRQ_HANDLED;
 
 	if (n & STS_PCI) {
-		msm_hsusb_set_speed(ui);
+		switch (readl(USB_PORTSC) & PORTSC_PSPD_MASK) {
+		case PORTSC_PSPD_FS:
+			dev_info(&ui->pdev->dev, "portchange USB_SPEED_FULL\n");
+			ui->gadget.speed = USB_SPEED_FULL;
+			break;
+		case PORTSC_PSPD_LS:
+			dev_info(&ui->pdev->dev, "portchange USB_SPEED_LOW\n");
+			ui->gadget.speed = USB_SPEED_LOW;
+			break;
+		case PORTSC_PSPD_HS:
+			dev_info(&ui->pdev->dev, "portchange USB_SPEED_HIGH\n");
+			ui->gadget.speed = USB_SPEED_HIGH;
+			break;
+		}
 		if (atomic_read(&ui->configured)) {
 			wake_lock(&ui->wlock);
 
@@ -1280,9 +1077,7 @@ static irqreturn_t usb_interrupt(int irq, void *data)
 
 	if (n & STS_URI) {
 		dev_info(&ui->pdev->dev, "reset\n");
-		spin_lock_irqsave(&ui->lock, flags);
-		ui->gadget.speed = USB_SPEED_UNKNOWN;
-		spin_unlock_irqrestore(&ui->lock, flags);
+
 #ifdef CONFIG_USB_OTG
 		/* notify otg to clear A_BIDL_ADIS timer */
 		if (ui->gadget.is_a_peripheral)
@@ -1323,9 +1118,6 @@ static irqreturn_t usb_interrupt(int irq, void *data)
 				ui->driver->disconnect(&ui->gadget);
 			}
 		}
-		/* Start phy stuck timer */
-		if (ui->pdata && ui->pdata->is_phy_status_timer_on)
-			mod_timer(&phy_status_timer, PHY_STATUS_CHECK_DELAY);
 	}
 
 	if (n & STS_SLI) {
@@ -1333,12 +1125,7 @@ static irqreturn_t usb_interrupt(int irq, void *data)
 
 		spin_lock_irqsave(&ui->lock, flags);
 		ui->usb_state = USB_STATE_SUSPENDED;
-#ifdef CONFIG_USB_AUTO_INSTALL
-		if( ui->flags == USB_FLAG_VBUS_OFFLINE ){
-		    usb_redo_offline_flag = USB_INTERRUPT_ABNORMAL;
-		}
 		ui->flags = USB_FLAG_SUSPEND;
-#endif
 		spin_unlock_irqrestore(&ui->lock, flags);
 
 		ui->driver->suspend(&ui->gadget);
@@ -1393,12 +1180,6 @@ static void usb_prepare(struct usb_info *ui)
 	INIT_DELAYED_WORK(&ui->chg_det, usb_chg_detect);
 	INIT_DELAYED_WORK(&ui->chg_stop, usb_chg_stop);
 	INIT_DELAYED_WORK(&ui->rw_work, usb_do_remote_wakeup);
-	if (ui->pdata && ui->pdata->is_phy_status_timer_on)
-		INIT_WORK(&ui->phy_status_check, usb_phy_stuck_recover);
-#ifdef CONFIG_USB_AUTO_INSTALL
-	android_delay_work_init(1);
-	ms_delay_work_init(1);
-#endif  /* CONFIG_USB_AUTO_INSTALL */
 }
 
 static void usb_reset(struct usb_info *ui)
@@ -1409,14 +1190,8 @@ static void usb_reset(struct usb_info *ui)
 
 	atomic_set(&ui->running, 0);
 
-	/*
-	 * PHY reset takes minimum 100 msec. Hence reset only link
-	 * during HNP. Reset PHY and link in B-peripheral mode.
-	 */
-	if (ui->gadget.is_a_peripheral)
-		otg->reset(ui->xceiv, 0);
-	else
-		otg->reset(ui->xceiv, 1);
+	/* Reset link and phy */
+	otg->reset(ui->xceiv, 1);
 
 	/* set usb controller interrupt threshold to zero*/
 	writel((readl(USB_USBCMD) & ~USBCMD_ITC_MASK) | USBCMD_ITC(0),
@@ -1528,12 +1303,6 @@ static void usb_do_work(struct work_struct *w)
 					break;
 				}
 				ui->irq = otg->irq;
-				ui->state = USB_STATE_ONLINE;
-				usb_do_work_check_vbus(ui);
-
-				if (!atomic_read(&ui->softconnect))
-					break;
-
 				msm72k_pullup_internal(&ui->gadget, 1);
 
 				if (!ui->gadget.is_a_peripheral)
@@ -1541,6 +1310,8 @@ static void usb_do_work(struct work_struct *w)
 							&ui->chg_det,
 							USB_CHG_DET_DELAY);
 
+				ui->state = USB_STATE_ONLINE;
+				usb_do_work_check_vbus(ui);
 			}
 			break;
 		case USB_STATE_ONLINE:
@@ -1576,9 +1347,6 @@ static void usb_do_work(struct work_struct *w)
 				msm72k_pullup_internal(&ui->gadget, 0);
 				spin_unlock_irqrestore(&ui->lock, iflags);
 
-#ifdef CONFIG_USB_AUTO_INSTALL
-				initiate_switch_to_cdrom(0);
-#endif  /* CONFIG_USB_AUTO_INSTALL */
 
 				/* if charger is initialized to known type
 				 * we must let modem know about charger
@@ -1607,15 +1375,6 @@ static void usb_do_work(struct work_struct *w)
 				pm_runtime_put_noidle(&ui->pdev->dev);
 				pm_runtime_suspend(&ui->pdev->dev);
 				wake_unlock(&ui->wlock);
-                /*wake up 1s*/
-                #ifdef CONFIG_HUAWEI_KERNEL
-                wake_lock_timeout(&ui->wlock, 1*HZ);
-                #endif
-				#ifdef CONFIG_HUAWEI_KERNEL
-				wake_unlock(&charger_wlock);				
-				printk(KERN_ERR "%s:unlock charger_wlock\n",__func__);
-				#endif
-
 				break;
 			}
 			if (flags & USB_FLAG_SUSPEND) {
@@ -1632,18 +1391,6 @@ static void usb_do_work(struct work_struct *w)
 				if (release_wlocks)
 					wake_unlock(&ui->wlock);
 
-#ifdef CONFIG_USB_AUTO_INSTALL
-              if( usb_redo_offline_flag == USB_INTERRUPT_ABNORMAL ){
-              spin_lock_irqsave(&ui->lock, iflags);
-              usb_redo_offline_flag = USB_INTERRUPT_NORMAL;
-
-              ui->flags = USB_FLAG_VBUS_OFFLINE;
-              ui->usb_state = USB_STATE_NOTATTACHED;
-              spin_unlock_irqrestore(&ui->lock, iflags);
-              
-              USB_PR("lxy USB_FLAG_SUSPEND: %s: ui->state=%d, flags=0x%x usb_state=%d \n", __func__, ui->state, (unsigned int)ui->flags, ui->usb_state);
-              }
-#endif 
 				/* TBD: Initiate LPM at usb bus suspend */
 				break;
 			}
@@ -1704,9 +1451,6 @@ static void usb_do_work(struct work_struct *w)
 				}
 				ui->irq = otg->irq;
 				enable_irq_wake(otg->irq);
-
-				if (!atomic_read(&ui->softconnect))
-					break;
 				msm72k_pullup_internal(&ui->gadget, 1);
 
 				if (!ui->gadget.is_a_peripheral)
@@ -1729,7 +1473,8 @@ void msm_hsusb_set_vbus_state(int online)
 	struct usb_info *ui = the_usb_info;
 
 	if (!ui) {
-		pr_err("%s called before driver initialized\n", __func__);
+		dev_err(&ui->pdev->dev, "msm_hsusb_set_vbus_state called"
+			" before driver initialized\n");
 		return;
 	}
 
@@ -1742,7 +1487,6 @@ void msm_hsusb_set_vbus_state(int online)
 		ui->usb_state = USB_STATE_POWERED;
 		ui->flags |= USB_FLAG_VBUS_ONLINE;
 	} else {
-		ui->gadget.speed = USB_SPEED_UNKNOWN;
 		ui->usb_state = USB_STATE_NOTATTACHED;
 		ui->flags |= USB_FLAG_VBUS_OFFLINE;
 	}
@@ -2182,22 +1926,15 @@ static int msm72k_pullup_internal(struct usb_gadget *_gadget, int is_active)
 static int msm72k_pullup(struct usb_gadget *_gadget, int is_active)
 {
 	struct usb_info *ui = container_of(_gadget, struct usb_info, gadget);
-	unsigned long flags;
 
-
-	atomic_set(&ui->softconnect, is_active);
-
-	spin_lock_irqsave(&ui->lock, flags);
-	if (ui->usb_state == USB_STATE_NOTATTACHED || ui->driver == NULL) {
-		spin_unlock_irqrestore(&ui->lock, flags);
-		return 0;
-	}
-	spin_unlock_irqrestore(&ui->lock, flags);
+	/* Reset PHY before enabling pull-up to workaround
+	 * PHY stuck issue during mutiple times of function
+	 * enable/disable.
+	 */
+	if (is_active)
+		usb_reset(ui);
 
 	msm72k_pullup_internal(_gadget, is_active);
-
-	if (is_active && !ui->gadget.is_a_peripheral)
-		schedule_delayed_work(&ui->chg_det, USB_CHG_DET_DELAY);
 
 	return 0;
 }
@@ -2252,12 +1989,14 @@ static int msm72k_udc_vbus_draw(struct usb_gadget *_gadget, unsigned mA)
 static int msm72k_set_selfpowered(struct usb_gadget *_gadget, int set)
 {
 	struct usb_info *ui = container_of(_gadget, struct usb_info, gadget);
+	struct msm_hsusb_gadget_platform_data *pdata =
+				ui->pdev->dev.platform_data;
 	unsigned long flags;
 	int ret = 0;
 
 	spin_lock_irqsave(&ui->lock, flags);
 	if (set) {
-		if (ui->pdata && ui->pdata->self_powered)
+		if (pdata && pdata->self_powered)
 			atomic_set(&ui->self_powered, 1);
 		else
 			ret = -EOPNOTSUPP;
@@ -2369,239 +2108,12 @@ static ssize_t show_usb_chg_type(struct device *dev,
 
 	return count;
 }
-
-#ifdef CONFIG_USB_AUTO_INSTALL
-static ssize_t msm_hsusb_store_fixusb(struct device *dev,
-					  struct device_attribute *attr,
-					  const char *buf, size_t size)
-{
-	unsigned long pid_index = 0;
-    unsigned nv_item = 4526;
-    int  rval = -1;
-    u16  pid;
-    
-    USB_PR("lxy: %s, buf=%s\n", __func__, buf);
-	if (!strict_strtoul(buf, 10, &pid_index))
-    {
-        rval = msm_proc_comm(PCOM_NV_WRITE, &nv_item, (unsigned*)&pid_index); 
-        if(0 == rval)
-        {
-            USB_PR("lxy: Fixusb write OK! nv(%d)=%d, rval=%d\n", nv_item, (int)pid_index, rval);
-        }
-        else
-        {
-            USB_PR("lxy: Fixusb write failed! nv(%d)=%d, rval=%d\n", nv_item, (int)pid_index, rval);
-        }
-
-        /* add new pid config for google */
-        if(pid_index == GOOGLE_INDEX)
-        {
-            set_usb_sn(usb_para_data.usb_para.usb_serial);
-        }
-        else if(pid_index == NORM_INDEX)
-        {
-            /* set sn if pid is norm_pid */
-            set_usb_sn(USB_SN_STRING);
-        }
-        else
-        {
-            set_usb_sn(NULL);
-        }
-
-        pid = pid_index_to_pid(pid_index);
-
-        /* update usb_para_info.usb_pid when the user set USB pid */
-        usb_para_info.usb_pid = pid;
-        usb_para_info.usb_pid_index = pid_index;
-        USB_PR("lxy: usb_para_info update: %d - 0x%x\n", 
-            usb_para_info.usb_pid_index, usb_para_info.usb_pid);
-
-		usb_switch_composition((unsigned short)pid, 0);
-        
-	}
-    else
-	{
-		USB_PR("lxy: %s: Fixusb conversion failed\n", __func__);
-	}
-
-	return size;
-}
-static ssize_t msm_hsusb_show_fixusb(struct device *dev,
-					 struct device_attribute *attr,
-					 char *buf)
-{
-	int i;
-    u16 pid_index = 0xff;
-    unsigned nv_item = 4526;
-    int  rval = -1;
-    rval = msm_proc_comm(PCOM_NV_READ, &nv_item, (unsigned*)&pid_index); 
-	if(0 == rval)
-	{
-        USB_PR("lxy: Fixusb read OK! nv(%d)=%d, rval=%d\n", nv_item, pid_index, rval);
-	}
-    else
-	{
-        USB_PR("lxy: Fixusb read failed! nv(%d)=%d, rval=%d\n", nv_item, pid_index, rval);
-	}
-	i = scnprintf(buf, PAGE_SIZE, "Fixusb read nv(%d)=%d, rval=%d\n", nv_item, pid_index, rval);
-	return i;
-}
-
-static ssize_t msm_hsusb_show_switchusb(struct device *dev,
-					 struct device_attribute *attr,
-					 char *buf)
-{
-	int i;
-
-    if(usb_switch_para.dest_pid == curr_usb_pid_ptr->udisk_pid)
-    {
-    	i = scnprintf(buf, PAGE_SIZE, "usb_switch_para.dest_pid is udisk\n");
-    }
-    else if(usb_switch_para.dest_pid == curr_usb_pid_ptr->norm_pid)
-    {
-    	i = scnprintf(buf, PAGE_SIZE, "usb_switch_para.dest_pid is norm\n");
-    }
-    else if(usb_switch_para.dest_pid == curr_usb_pid_ptr->cdrom_pid)
-    {
-    	i = scnprintf(buf, PAGE_SIZE, "usb_switch_para.dest_pid is cdrom\n");
-    }
-    /* new requirement: usb tethering */
-    else if(usb_switch_para.dest_pid == curr_usb_pid_ptr->wlan_pid)
-    {
-    	i = scnprintf(buf, PAGE_SIZE, "usb_switch_para.dest_pid is wlan\n");
-    }
-    else
-    {
-    	i = scnprintf(buf, PAGE_SIZE, "usb_switch_para.dest_pid is not set\n");
-    }
-
-	return i;
-}
-
-static ssize_t msm_hsusb_store_switchusb(struct device *dev,
-					  struct device_attribute *attr,
-					  const char *buf, size_t size)
-{
-    char *udisk = "udisk";
-    char *norm="norm";
-    char *cdrom="cdrom";
-    char *auth="auth";
-    char *wlanther="ther_unet";
-    char *wlanunther="unther_unet";
-    USB_PR("lxy: %s, size = %d, buf = %s\n", __func__, size, buf);
-
-    if(1 == usb_switch_para.inprogress)
-    {
-        USB_PR("lxy: %s, switch blocked, buf=%s\n", __func__, buf);
-        return size;
-    }
-
-	usb_switch_para.inprogress =1;
-    /* new requirement: usb tethering */
-    if(!memcmp(buf, wlanunther, strlen(wlanunther)))
-    {
-        usb_switch_composition((unsigned short)usb_para_info.usb_pid, 0);
-        return size;
-    }
-    else if(!memcmp(buf, wlanther, strlen(wlanther)))
-    {
-        usb_switch_composition((unsigned short)curr_usb_pid_ptr->wlan_pid, 0);
-        return size;
-    }
-
-    /* add new pid config for google */
-    if(GOOGLE_INDEX == usb_para_info.usb_pid_index)
-    {
-        USB_PR("lxy: switch blocked, usb_para_info.usb_pid_index=%d\n", usb_para_info.usb_pid_index);
-		usb_switch_para.inprogress = 0;
-        return size;
-    }
-
-    if(!memcmp(buf, udisk, strlen(udisk)))
-    {
-        usb_switch_para.dest_pid = curr_usb_pid_ptr->udisk_pid;
-    }
-    else if(!memcmp(buf, norm, strlen(norm)))
-    {
-        usb_switch_para.dest_pid = curr_usb_pid_ptr->norm_pid;
-    }
-    else if(!memcmp(buf, cdrom, strlen(cdrom)))
-    {
-        usb_switch_para.dest_pid = curr_usb_pid_ptr->cdrom_pid;
-    }
-    else if(!memcmp(buf, auth, strlen(auth)))
-    {
-        usb_switch_para.dest_pid = curr_usb_pid_ptr->auth_pid;
-    }
-    else
-    {
-        USB_PR("lxy: invalid input parameter\n");
-		usb_switch_para.inprogress = 0;
-        return size;
-    }
-
-    /* support switch udisk interface from pc */
-    /* if the new pid is same as current pid, do nothing */
-    if (android_get_product_id() != usb_switch_para.dest_pid)
-    {
-      usb_switch_composition((unsigned short)usb_switch_para.dest_pid, 0);
-    }
-    else
-    {
-      USB_PR("lxy: switch block for already in pid state.\n");
-      usb_switch_para.inprogress = 0;
-    }
-    
-	return size;
-}
-
-
-static ssize_t msm_hsusb_show_sd_status(struct device *dev,
-					 struct device_attribute *attr,
-					 char *buf)
-{
-	int i;
-
-    i = scnprintf(buf, PAGE_SIZE, "is_mmc_exist = %d\n", is_mmc_exist);
-    
-	return i;
-}
-
-/* support switch udisk interface from pc */
-/* set the sd exist state by vold */
-static ssize_t msm_hsusb_store_sd_status(struct device *dev,
-            struct device_attribute *attr,
-            const char *buf, size_t size)
-{
-  if (1 != size){
-    return size;
-  }
-  
-  is_mmc_exist = *buf;
-  USB_PR("msm_hsusb_store_sd_status: is_mmc_exist=%d\n", is_mmc_exist);
-    
-  return size;
-}
-#endif  /* CONFIG_USB_AUTO_INSTALL */
-
 static DEVICE_ATTR(wakeup, S_IWUSR, 0, usb_remote_wakeup);
-static DEVICE_ATTR(usb_state, S_IRUGO, show_usb_state, 0);
+static DEVICE_ATTR(usb_state, S_IRUSR, show_usb_state, 0);
 static DEVICE_ATTR(usb_speed, S_IRUSR, show_usb_speed, 0);
 static DEVICE_ATTR(chg_type, S_IRUSR, show_usb_chg_type, 0);
 static DEVICE_ATTR(chg_current, S_IWUSR | S_IRUSR,
 		show_usb_chg_current, store_usb_chg_current);
-
-/* we change the permissions of these nodes 
- * in order to meet the requirements of AT&T
- */
-#ifdef CONFIG_USB_AUTO_INSTALL
-static DEVICE_ATTR(fixusb, 0664, 
-        msm_hsusb_show_fixusb, msm_hsusb_store_fixusb);
-static DEVICE_ATTR(switchusb, 0664, 
-        msm_hsusb_show_switchusb, msm_hsusb_store_switchusb);
-static DEVICE_ATTR(sdstatus, 0664, 
-        msm_hsusb_show_sd_status, msm_hsusb_store_sd_status);
-#endif  /* CONFIG_USB_AUTO_INSTALL */
 
 #ifdef CONFIG_USB_OTG
 static ssize_t store_host_req(struct device *dev,
@@ -2661,6 +2173,7 @@ static struct attribute_group otg_attr_grp = {
 static int msm72k_probe(struct platform_device *pdev)
 {
 	struct usb_info *ui;
+	struct msm_hsusb_gadget_platform_data *pdata;
 	struct msm_otg *otg;
 	int retval;
 
@@ -2670,7 +2183,12 @@ static int msm72k_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	ui->pdev = pdev;
-	ui->pdata = pdev->dev.platform_data;
+
+	if (pdev->dev.platform_data) {
+		pdata = pdev->dev.platform_data;
+		ui->phy_reset = pdata->phy_reset;
+		ui->phy_init_seq = pdata->phy_init_seq;
+	}
 
 	ui->buf = dma_alloc_coherent(&pdev->dev, 4096, &ui->dma, GFP_KERNEL);
 	if (!ui->buf)
@@ -2711,11 +2229,6 @@ static int msm72k_probe(struct platform_device *pdev)
 	wake_lock_init(&ui->wlock,
 			WAKE_LOCK_SUSPEND, "usb_bus_active");
 
-	#ifdef CONFIG_HUAWEI_KERNEL
-	/*wakelock for charger, prevent arm11 enter sleep.avoid mobile dump.*/
-	wake_lock_init(&charger_wlock, WAKE_LOCK_SUSPEND,"charger_active");
-	printk(KERN_ERR "%s:wakelock init \n",__func__);
-	#endif
 	usb_debugfs_init(ui);
 
 	usb_prepare(ui);
@@ -2736,18 +2249,11 @@ static int msm72k_probe(struct platform_device *pdev)
 			__func__, retval);
 		switch_dev_unregister(&ui->sdev);
 		wake_lock_destroy(&ui->wlock);
-		#ifdef CONFIG_HUAWEI_KERNEL
-		wake_lock_destroy(&charger_wlock);
-		printk(KERN_ERR "%s:wakelock distroy \n",__func__);
-		#endif
 		return usb_free(ui, retval);
 	}
 
 	pm_runtime_enable(&pdev->dev);
 
-	/* Setup phy stuck timer */
-	if (ui->pdata && ui->pdata->is_phy_status_timer_on)
-		setup_timer(&phy_status_timer, usb_phy_status_check_timer, 0);
 	return 0;
 }
 
@@ -2775,7 +2281,6 @@ int usb_gadget_register_driver(struct usb_gadget_driver *driver)
 	ui->gadget.ep0 = &ui->ep0in.ep;
 	INIT_LIST_HEAD(&ui->gadget.ep0->ep_list);
 	ui->gadget.speed = USB_SPEED_UNKNOWN;
-	atomic_set(&ui->softconnect, 1);
 
 	for (n = 1; n < 16; n++) {
 		struct msm_endpoint *ept = ui->ept + n;
@@ -2827,23 +2332,6 @@ int usb_gadget_register_driver(struct usb_gadget_driver *driver)
 		dev_err(&ui->pdev->dev,
 			"failed to create sysfs entry(chg_current):"
 			"err:(%d)\n", retval);
-#ifdef CONFIG_USB_AUTO_INSTALL
-	retval = device_create_file(&ui->gadget.dev, &dev_attr_fixusb);
-	if (retval != 0)
-		dev_err(&ui->pdev->dev,
-			"failed to create sysfs entry(fixusb):"
-			"err:(%d)\n", retval);
-	retval = device_create_file(&ui->gadget.dev, &dev_attr_switchusb);
-	if (retval != 0)
-		dev_err(&ui->pdev->dev,
-			"failed to create sysfs entry(switchusb):"
-			"err:(%d)\n", retval);
-	retval = device_create_file(&ui->gadget.dev, &dev_attr_sdstatus);
-	if (retval != 0)
-		dev_err(&ui->pdev->dev,
-			"failed to create sysfs entry(sdstatus):"
-			"err:(%d)\n", retval);
-#endif  /* CONFIG_USB_AUTO_INSTALL */
 	usb_start(ui);
 
 	return 0;
@@ -2878,11 +2366,6 @@ int usb_gadget_unregister_driver(struct usb_gadget_driver *driver)
 	device_remove_file(&dev->gadget.dev, &dev_attr_usb_speed);
 	device_remove_file(&dev->gadget.dev, &dev_attr_chg_type);
 	device_remove_file(&dev->gadget.dev, &dev_attr_chg_current);
-#ifdef CONFIG_USB_AUTO_INSTALL
-	device_remove_file(&dev->gadget.dev, &dev_attr_fixusb);
-	device_remove_file(&dev->gadget.dev, &dev_attr_switchusb);
-	device_remove_file(&dev->gadget.dev, &dev_attr_sdstatus);
-#endif  /* CONFIG_USB_AUTO_INSTALL */
 	driver->disconnect(&dev->gadget);
 	driver->unbind(&dev->gadget);
 	dev->gadget.dev.driver = NULL;

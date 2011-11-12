@@ -2665,37 +2665,14 @@ static struct platform_device mass_storage_device = {
 #endif
 
 #ifdef CONFIG_USB_ANDROID
-#ifdef CONFIG_USB_AUTO_INSTALL
-static char *usb_functions_hw_normal_adb[] = {
-  "modem",
-  "nmea",
-  "usb_mass_storage",
-  "adb",
-  "diag",
+static char *usb_functions_default[] = {
+  "usb_mass_storage"
 };
 
-static char *usb_functions_hw_normal[] = {
-  "modem",
-  "nmea",
-  "usb_mass_storage",
+static char *usb_functions_default_adb[] = {
+  "adb"
 };
 
-static char *usb_functions_hw_ms[] = {
-  "usb_mass_storage",
-};
-
-static char *usb_functions_google_ms[] = {
-  "usb_mass_storage",
-};
-
-static char *usb_functions_google_ms_adb[] = {
-  "usb_mass_storage",
-  "adb",  
-};
-
-static char *usb_functions_rndis[] = {
-  "rndis", 
-};
 
 
 static char *usb_functions_all[] = {  
@@ -2719,99 +2696,25 @@ static char *usb_functions_all[] = {
 #endif
 };
 
-static struct android_usb_product_hw usb_products[] = {
-  {
-    .adb_product_id = PID_UDISK,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_hw_ms),
-    .adb_functions  = usb_functions_hw_ms,
-    .product_id = PID_UDISK,
-    .num_functions  = ARRAY_SIZE(usb_functions_hw_ms),
-    .functions  = usb_functions_hw_ms,
-    .nluns = 1,
-  },
-  {
-    .adb_product_id = PID_ONLY_CDROM,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_hw_ms),
-    .adb_functions  = usb_functions_hw_ms,
-    .product_id = PID_ONLY_CDROM,
-    .num_functions  = ARRAY_SIZE(usb_functions_hw_ms),
-    .functions  = usb_functions_hw_ms,
-    .nluns = 1,
-  },
-  {
-    .adb_product_id = PID_AUTH,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_hw_normal_adb),
-    .adb_functions  = usb_functions_hw_normal_adb,
-    .product_id = PID_AUTH,
-    .num_functions  = ARRAY_SIZE(usb_functions_hw_normal_adb),
-    .functions  = usb_functions_hw_normal_adb,
-    .nluns = 1,
-  },
-  {
-    .adb_product_id = PID_NORMAL,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_hw_normal_adb),
-    .adb_functions  = usb_functions_hw_normal_adb,
-    .product_id = PID_NORMAL,
-    .num_functions = ARRAY_SIZE(usb_functions_hw_normal),
-    .functions  = usb_functions_hw_normal,
-    .nluns = 1,
-  },
-  {
-    .adb_product_id = PID_ONLY_CDROM_TMO,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_hw_ms),
-    .adb_functions  = usb_functions_hw_ms,
-    .product_id = PID_ONLY_CDROM_TMO,
-    .num_functions  = ARRAY_SIZE(usb_functions_hw_ms),
-    .functions  = usb_functions_hw_ms,
-    .nluns = 1,
-  },
-  {
-    .adb_product_id = PID_AUTH_TMO,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_hw_normal_adb),
-    .adb_functions  = usb_functions_hw_normal_adb,
-    .product_id = PID_AUTH_TMO,
-    .num_functions  = ARRAY_SIZE(usb_functions_hw_normal_adb),
-    .functions  = usb_functions_hw_normal_adb,
-    .nluns = 1,
-  },
-  {
-    .adb_product_id = PID_NORMAL_TMO,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_hw_normal_adb),
-    .adb_functions  = usb_functions_hw_normal_adb,
-    .product_id = PID_NORMAL_TMO,
-    .num_functions = ARRAY_SIZE(usb_functions_hw_normal),
-    .functions  = usb_functions_hw_normal,
-    .nluns = 1,
-  },
-  {
-    .adb_product_id = PID_GOOGLE,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_google_ms_adb),
-    .adb_functions  = usb_functions_google_ms_adb,
-    .product_id = PID_GOOGLE_MS,
-    .num_functions = ARRAY_SIZE(usb_functions_google_ms),
-    .functions  = usb_functions_google_ms,
-    .nluns = 3,
-  },
-  {
-    .adb_product_id = PID_WLAN,
-    .adb_num_functions  = ARRAY_SIZE(usb_functions_rndis),
-    .adb_functions  = usb_functions_rndis,
-    .product_id = PID_WLAN,
-    .num_functions  = ARRAY_SIZE(usb_functions_rndis),
-    .functions  = usb_functions_rndis,
-    .nluns = 1,
-  },
+static struct android_usb_product usb_products[] = {
+	{
+		.product_id	= 0x9026,
+		.num_functions	= ARRAY_SIZE(usb_functions_default),
+		.functions	= usb_functions_default,
+	},
+	{
+		.product_id	= 0x9025,
+		.num_functions	= ARRAY_SIZE(usb_functions_default_adb),
+		.functions	= usb_functions_default_adb,
+	},
 };
 
 
-static char product_name[MAX_NAME_LEN];
-static char vendor_name[MAX_NAME_LEN];
-static char manufacturer_name[MAX_NAME_LEN];
-#define MAX_LENS 3
+#define MAX_LENS 1
 static struct usb_mass_storage_platform_data mass_storage_pdata = {
   .nluns    = MAX_LENS,
-  .vendor   = vendor_name,//"Qualcomm Incorporated",
-  .product        = product_name,//"Mass storage",
+  .vendor   = "Qualcomm Incorporated",
+  .product  = "Mass storage",
   .release  = 0x0100,
 };
 
@@ -2825,8 +2728,8 @@ static struct platform_device usb_mass_storage_device = {
 
 static struct usb_ether_platform_data rndis_pdata = {
   /* ethaddr is filled by board_serialno_setup */
-  .vendorID = HUAWEI_VID,
-  .vendorDescr  = manufacturer_name,//"Huawei Incorporated",
+  .vendorID = 0x05C6,
+  .vendorDescr  = "Huawei Incorporated",
 };
 
 static struct platform_device rndis_device = {
@@ -2838,18 +2741,18 @@ static struct platform_device rndis_device = {
 };
 
 static struct android_usb_platform_data android_usb_pdata = {
-  .vendor_id  = HUAWEI_VID,
+  .vendor_id  = 0x05C6,
   .product_id = 0x9026,
   .version  = 0x0100,
-  .product_name   = product_name,
-  .manufacturer_name  = manufacturer_name,//"Huawei Incorporated",
+  .product_name   = "Ideos U8800pro",
+  .manufacturer_name  = "Huawei Incorporated",
   .num_products = ARRAY_SIZE(usb_products),
   .products = usb_products,
   .num_functions = ARRAY_SIZE(usb_functions_all),
   .functions = usb_functions_all,
   .serial_number = "1234567890ABCDEF",
 };
-#endif
+
 
 
 static struct platform_device android_usb_device = {
@@ -6632,7 +6535,7 @@ void __init config_wifi_for_low_consume(void)
 }
 #endif
 
-#ifdef CONFIG_USB_AUTO_INSTALL
+#if 0//#ifdef CONFIG_USB_AUTO_INSTALL
 /* provide a method to map pid_index to usb_pid, 
  * pid_index is kept in NV(4526). 
  * At power up, pid_index is read in modem and transfer to app in share memory.
@@ -6834,7 +6737,7 @@ static void __init msm7x30_init(void)
 	msm_device_hsusb_peripheral.dev.platform_data = &msm_hsusb_pdata;
 #endif
 
-#ifdef CONFIG_USB_AUTO_INSTALL
+#if 0 //#ifdef CONFIG_USB_AUTO_INSTALL
     proc_usb_para();
 #endif  /* #ifdef CONFIG_USB_AUTO_INSTALL */
 
